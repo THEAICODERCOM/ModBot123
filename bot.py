@@ -12,6 +12,7 @@ from typing import Optional
 # Configuration
 TOKEN_FILE = 'token.txt'
 TRUST_FILE_NAME = 'trust_scores.json'
+BLOCK_FILE_NAME = 'blocked_users.json'
 
 def get_token():
     if os.path.exists(TOKEN_FILE):
@@ -54,7 +55,17 @@ def find_trust_file():
                         
     return os.path.join(os.getcwd(), TRUST_FILE_NAME)
 
+def find_block_file():
+    """Deep searches for blocked_users.json."""
+    base_search = [os.getcwd(), os.path.expanduser("~")]
+    for base in base_search:
+        full_path = os.path.join(base, BLOCK_FILE_NAME)
+        if os.path.exists(full_path):
+            return full_path
+    return os.path.join(os.getcwd(), BLOCK_FILE_NAME)
+
 TRUST_FILE = find_trust_file()
+BLOCK_FILE = find_block_file()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -65,10 +76,12 @@ class MyBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix='!', intents=intents)
         self.trust_data = {}
+        self.blocked_users = []
         self.antiraid = False # Anti-raid join gate toggle
 
     async def setup_hook(self):
         self.load_trust_data()
+        self.load_blocked_users()
         # Sync slash commands
         await self.tree.sync()
         print("Slash commands synced.")
@@ -91,6 +104,20 @@ class MyBot(commands.Bot):
     def save_trust_data(self):
         with open(TRUST_FILE, 'w') as f:
             json.dump(self.trust_data, f, indent=4)
+
+    def load_blocked_users(self):
+        if os.path.exists(BLOCK_FILE):
+            try:
+                with open(BLOCK_FILE, 'r') as f:
+                    self.blocked_users = json.load(f)
+            except:
+                self.blocked_users = []
+        else:
+            self.blocked_users = []
+
+    def save_blocked_users(self):
+        with open(BLOCK_FILE, 'w') as f:
+            json.dump(self.blocked_users, f, indent=4)
 
     def get_trust(self, user_id: str):
         return self.trust_data.get(user_id, 100)
@@ -404,9 +431,15 @@ async def cleanuser(interaction: discord.Interaction, member: discord.Member, li
             
     await interaction.followup.send(f"🧹 Cleaned up **{total_deleted}** messages from {member.mention} across the server.")
 
-@bot.tree.command(name="banrole", description="Bans everyone who has a specific role")
-@app_commands.checks.has_permissions(ban_members=True)
+@bot.tree.command(name="banrole", description="Bans everyone who has a specific role (Server Owner only)")
+@app_commands.checks.has_permissions(administrator=True) # Secondary check
+@app_commands.default_permissions(administrator=True) # This hides the command from non-admins in the UI
 async def banrole(interaction: discord.Interaction, role: discord.Role, reason: Optional[str] = "Mass role ban"):
+    # Strict Server Owner check
+    if interaction.user.id != interaction.guild.owner_id:
+        await interaction.response.send_message("❌ This command can only be used by the **Server Owner**.", ephemeral=True)
+        return
+
     await interaction.response.defer()
     
     count = 0
@@ -425,6 +458,139 @@ async def banrole(interaction: discord.Interaction, role: discord.Role, reason: 
                 failed += 1
                 
     await interaction.followup.send(f"🔨 Banned **{count}** members with the role `{role.name}`. (Failed: {failed})")
+
+class InviteView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=None)
+        self.user_id = user_id
+
+    @discord.ui.button(label="Stop receiving invites from this bot", style=discord.ButtonStyle.danger)
+    async def block_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user_id_str = str(self.user_id)
+        if user_id_str not in bot.blocked_users:
+            bot.blocked_users.append(user_id_str)
+            bot.save_blocked_users()
+            await interaction.response.send_message("✅ You have successfully blocked all future invites from this bot. You can leave the server now.", ephemeral=True)
+            # Disable the button
+            button.disabled = True
+            await interaction.message.edit(view=self)
+        else:
+            await interaction.response.send_message("You are already on the block list.", ephemeral=True)
+
+@bot.tree.command(name="inviteuser", description="Sends a server invite to a user via DM (Bot Owner only)")
+async def inviteuser(interaction: discord.Interaction, user_id: str):
+    # Bot Owner Check (Using application info)
+    app_info = await bot.application_info()
+    if interaction.user.id != app_info.owner.id:
+        await interaction.response.send_message("❌ This command is restricted to the **Bot Owner**.", ephemeral=True)
+        return
+
+    try:
+        user = await bot.fetch_user(int(user_id))
+    except (ValueError, discord.NotFound):
+        await interaction.response.send_message("❌ User not found. Please provide a valid User ID.", ephemeral=True)
+        return
+
+    # Check if user is blocked
+    if str(user.id) in bot.blocked_users:
+        await interaction.response.send_message(f"❌ Cannot send invite. **{user.name}** has blocked invites from this bot.", ephemeral=True)
+        return
+
+    # Create a 24h invite link for the current channel
+    try:
+        invite = await interaction.channel.create_invite(max_age=86400, max_uses=1, unique=True, reason=f"Invited by {interaction.user}")
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ I don't have permission to create invites in this channel.", ephemeral=True)
+        return
+
+    # Prepare interactive view
+    view = InviteView(user.id)
+
+    try:
+        await user.send(
+            f"👋 Hello! **{interaction.user.name}** has invited you to join **{interaction.guild.name}**!\n\n"
+            f"Here is your invite link (expires in 24h):\n{invite.url}\n\n"
+            f"*If you don't want to receive these messages anymore, click the button below to block this feature.*",
+            view=view
+        )
+        await interaction.response.send_message(f"✅ Successfully sent an invite to **{user.name}** ({user.id}).", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message(f"❌ Could not send DM to **{user.name}**. They likely have DMs disabled or have blocked the bot.", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ An error occurred: {str(e)}", ephemeral=True)
+
+@bot.tree.command(name="massinvite", description="Invites multiple users by ID (Bot Owner only)")
+@app_commands.describe(
+    user_ids="A list of User IDs separated by spaces or commas",
+    exclude_ids="Optional: User IDs to skip (separated by spaces or commas)"
+)
+async def massinvite(interaction: discord.Interaction, user_ids: str, exclude_ids: Optional[str] = None):
+    # Bot Owner Check
+    app_info = await bot.application_info()
+    if interaction.user.id != app_info.owner.id:
+        await interaction.response.send_message("❌ This command is restricted to the **Bot Owner**.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    # Parse IDs
+    def parse_ids(id_str):
+        if not id_str: return []
+        return re.findall(r'\d+', id_str)
+
+    target_ids = parse_ids(user_ids)
+    excluded = set(parse_ids(exclude_ids)) if exclude_ids else set()
+    
+    if not target_ids:
+        await interaction.followup.send("❌ No valid User IDs found in your input.")
+        return
+
+    success = 0
+    skipped = 0
+    failed = 0
+    blocked_count = 0
+
+    # Create one invite for the batch
+    try:
+        invite = await interaction.channel.create_invite(max_age=86400, max_uses=0, unique=True, reason=f"Mass invite by {interaction.user}")
+    except discord.Forbidden:
+        await interaction.followup.send("❌ I don't have permission to create invites in this channel.")
+        return
+
+    for uid in target_ids:
+        # Skip if in exclude list
+        if uid in excluded:
+            skipped += 1
+            continue
+            
+        # Skip if blocked the bot
+        if uid in bot.blocked_users:
+            blocked_count += 1
+            continue
+
+        try:
+            user = await bot.fetch_user(int(uid))
+            view = InviteView(user.id)
+            await user.send(
+                f"👋 Hello! **{interaction.user.name}** has invited you to join **{interaction.guild.name}**!\n\n"
+                f"Here is your invite link:\n{invite.url}\n\n"
+                f"*If you don't want to receive these messages anymore, click the button below to block this feature.*",
+                view=view
+            )
+            success += 1
+        except discord.Forbidden:
+            failed += 1
+        except Exception:
+            failed += 1
+
+    report = (
+        f"📊 **Mass Invite Report**\n"
+        f"✅ Sent: {success}\n"
+        f"🚫 Failed (DMs off/Blocked): {failed}\n"
+        f"🛑 Already Blocked Bot: {blocked_count}\n"
+        f"⏭️ Skipped (Excluded): {skipped}"
+    )
+    await interaction.followup.send(report)
 
 @bot.tree.command(name="nuke", description="Deletes and recreates a channel to clear all messages")
 @app_commands.checks.has_permissions(administrator=True)
@@ -499,7 +665,7 @@ async def help_command(interaction: discord.Interaction):
         "**/purge <amount>** - Delete multiple messages\n"
         "**/kick <@user> [reason]** - Kick member (-30 trust)\n"
         "**/ban <@user> [reason]** - Ban member (-100 trust)\n"
-        "**/banrole <@role>** - Ban everyone with a role\n"
+        "**/banrole <@role>** - Ban everyone with a role (Server Owner only)\n"
         "**/massban <ids/mentions>** - Ban multiple users\n"
         "**/unban <user_id>** - Unban a user\n"
         "**/timeout <@user> <mins> [reason]** - Mute member\n"
@@ -513,6 +679,8 @@ async def help_command(interaction: discord.Interaction):
         "**/antiraid <on/off>** - Auto-kick new joins\n"
         "**/cleanuser <@user>** - Purge user from all channels\n"
         "**/slowmode <secs>** - Set channel slowmode\n"
+        "**/inviteuser <user_id>** - Invite a user via DM (Bot Owner only)\n"
+        "**/massinvite <ids> [exclude]** - Mass invite users (Bot Owner only)\n"
         "**/nuke** - Recreate channel"
     )
     embed.add_field(name="🛡️ Moderation", value=mod_cmds, inline=False)
@@ -589,3 +757,4 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             await interaction.response.send_message(f"An error occurred: {error}", ephemeral=True)
 
 bot.run(TOKEN)
+
